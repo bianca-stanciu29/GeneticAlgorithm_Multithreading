@@ -1,0 +1,313 @@
+#include <unistd.h>
+#include <fcntl.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <stdio.h>
+#include "so_stdio.h"
+
+typedef struct _so_file{
+	//buffer pentru stocarea datelor
+	char buffer[4096];
+	int file_descriptor;
+	//pozitia cursorului in buffer
+	int cursor;
+	//dimensiunea bufferului
+	int size_file;
+
+	int size;
+	//pentru verificare final de buffer
+	int eof;
+	//pentru verificare erori
+	int error;
+
+	int op;
+} SO_FILE;
+
+
+
+FUNC_DECL_PREFIX SO_FILE *so_fopen(const char *pathname, const char *mode)
+{
+	//alocare structura
+	SO_FILE *f = (SO_FILE *)malloc(sizeof(SO_FILE));
+	//initializare date
+	f->cursor = 0;
+	f->size_file = 0;
+	f->eof = 0;
+	f->error = 0;
+	f->op = 0;
+	f->size = 0;
+	if (strncmp(mode, "r", 2) == 0) {
+		f->file_descriptor = open(pathname, O_RDONLY);
+
+		if (f->file_descriptor < 0) {
+			close(f->file_descriptor);
+			free(f);
+			return NULL;
+		}
+	} else if (strncmp(mode, "r+", 2) == 0) {
+		f->file_descriptor = open(pathname, O_RDWR, 0644);
+
+		if (f->file_descriptor < 0) {
+			close(f->file_descriptor);
+			free(f);
+			return NULL;
+		}
+	} else if (strncmp(mode, "w", 2) == 0) {
+		f->file_descriptor = open(pathname, O_WRONLY | O_TRUNC | O_CREAT, 0644);
+
+		if (f->file_descriptor < 0) {
+			close(f->file_descriptor);
+			free(f);
+			return NULL;
+		}
+	} else if (strncmp(mode, "w+", 2) == 0) {
+		f->file_descriptor = open(pathname, O_RDWR | O_TRUNC | O_CREAT, 0644);
+
+		if (f->file_descriptor < 0) {
+			close(f->file_descriptor);
+			free(f);
+			return NULL;
+		}
+	} else if (strncmp(mode, "a", 2) == 0) {
+		f->file_descriptor = open(pathname, O_WRONLY | O_APPEND | O_CREAT, 0644);
+		// f->cursor = lseek(f->file_descriptor, 0, SEEK_END);
+
+		if (f->file_descriptor < 0) {
+			close(f->file_descriptor);
+			free(f);
+			return NULL;
+
+		}
+
+	} else if (strncmp(mode, "a+", 2) == 0) {
+		f->file_descriptor = open(pathname, O_RDWR | O_APPEND | O_CREAT, 0644);
+		// f->cursor = lseek(f->file_descriptor, 0, SEEK_END);
+
+		if (f->file_descriptor < 0) {
+			close(f->file_descriptor);
+			free(f);
+			return NULL;
+		}
+	} else {
+		free(f);
+		return NULL;
+	}
+	return f;
+}
+
+FUNC_DECL_PREFIX int so_fclose(SO_FILE *stream)
+{
+	int c;
+	int eof = 0;
+	int err;
+
+	err = so_fflush(stream);
+	c = close(stream->file_descriptor);
+	if (c < 0 || (err == -1))
+		eof = SO_EOF;
+	free(stream);
+	return eof;
+}
+
+FUNC_DECL_PREFIX int so_fgetc(SO_FILE *stream)
+{
+	if (stream == NULL)
+		return SO_EOF;
+	stream->op = 1;
+	if (stream->cursor == stream->size_file) {
+		stream->cursor = 0;
+		stream->size_file = 0;
+		int rc = read(stream->file_descriptor, stream->buffer, 4096);
+
+		if (rc > 0) {
+			//dupa citire se reinitializeaza si dimensiunea bufferului
+			stream->size_file = rc;
+			stream->size += rc;
+		} else {
+			//daca nu se poate citi
+			stream->eof = 1;
+			return SO_EOF;
+		}
+	}
+   //caracterul de pe pozitia cursorului
+	return (int)stream->buffer[stream->cursor++];
+}
+
+ssize_t xwrite(int fd, const void *buf, size_t count)
+{
+	size_t bytes_written = 0;
+
+	while (bytes_written < count) {
+		ssize_t bytes_written_now = write(fd, buf + bytes_written,
+										  count - bytes_written);
+
+		if (bytes_written_now <= 0) /* I/O error */
+			return -1;
+
+		bytes_written += bytes_written_now;
+	}
+
+	return bytes_written;
+}
+
+FUNC_DECL_PREFIX int so_fputc(int c, SO_FILE *stream)
+{
+	if (stream == NULL)
+		return SO_EOF;
+
+	if (stream->size_file >= 4096) {
+		int w = xwrite(stream->file_descriptor, stream->buffer, 4096);
+
+		if (w > 0) {
+			stream->size_file = 0;
+			stream->cursor = 0;
+			memset(stream->buffer, 0, 4096);
+		} else {
+			//printf("bascalie\n");
+			stream->eof = 1;
+			return SO_EOF;
+		}
+	stream->op = 2;
+
+
+	}
+	stream->buffer[stream->size_file] = (char) c;
+	stream->size_file++;
+	stream->size++;
+	return (int)c;
+}
+
+FUNC_DECL_PREFIX size_t so_fread(void *ptr, size_t size, size_t nmemb, SO_FILE *stream)
+{
+	if (stream == NULL)
+		return SO_EOF;
+	int total_size = nmemb * size;
+	int chr_read = 0;
+	int last_poz = 0;
+	int rc;
+	int sum = 0;
+	int test = 0;
+
+	while (total_size != 0 && stream->eof == 0) {
+
+		if (stream->cursor == stream->size_file) {
+			stream->cursor = 0;
+			stream->size_file = 0;
+			rc =  read(stream->file_descriptor, stream->buffer, 4096);
+			if (rc < 0) {
+				stream->eof = 1;
+				stream->error = 1;
+				return 0;
+			}
+			chr_read = rc;
+			if (rc == 0)
+				stream->eof = 1;
+
+			if (rc <= 4096)
+				chr_read = rc;
+			stream->op = 1;
+			test += rc;
+			stream->size_file = rc;
+		}
+		if (total_size < (stream->size_file - stream->cursor))
+			chr_read  = total_size;
+		else
+			chr_read = stream->size_file - stream->cursor;
+		memcpy(ptr + last_poz, &stream->buffer[stream->cursor], chr_read);
+		stream->cursor += chr_read;
+		last_poz += chr_read;
+		sum += chr_read;
+		stream->size += chr_read;
+		total_size -= chr_read;
+	}
+
+	if (total_size != 0)
+		return test;
+
+	//return test / size;
+	return sum / size;
+}
+
+
+
+FUNC_DECL_PREFIX size_t so_fwrite(const void *ptr, size_t size, size_t nmemb, SO_FILE *stream)
+{
+		int total = size*nmemb;
+
+		for (int i = 0; i < total; i++)
+			so_fputc(*(char *)(ptr + i), stream);
+		return total / size;
+}
+
+
+int so_fseek(SO_FILE *stream, long offset, int whence)
+{
+	if (stream->op == 2)
+		so_fflush(stream);
+	else if (stream->op == 1) {
+		stream->size_file = 0;
+		stream->cursor = 0;
+		memset(stream->buffer, 0, 4096);
+	}
+	stream->size =  lseek(stream->file_descriptor, offset, whence);
+   // printf("%d\n", stream->size_file);
+	return 0;
+}
+
+int so_fileno(SO_FILE *stream)
+{
+
+	if (stream == NULL)
+		return SO_EOF;
+	return stream->file_descriptor;
+}
+
+FUNC_DECL_PREFIX int so_feof(SO_FILE *stream)
+{
+	if (stream == NULL)
+		return SO_EOF;
+	return stream->eof;
+}
+
+FUNC_DECL_PREFIX int so_ferror(SO_FILE *stream)
+{
+	return stream->error;
+}
+
+FUNC_DECL_PREFIX int so_fflush(SO_FILE *stream)
+{
+
+   // int w = write(stream->file_descriptor, stream->buffer, sizeof(char) * stream->size_file);
+	if (stream->size_file != 0) {
+
+		int w = xwrite(stream->file_descriptor, stream->buffer, sizeof(char) * stream->size_file);
+
+		if (w > 0) {
+			stream->size_file = 0;
+			stream->cursor = 0;
+			memset(stream->buffer, 0, 4096);
+		} else if (w == 0) {
+			stream->eof = 1;
+			stream->error = 1;
+
+			return -1;
+		}
+		stream->op = 2;
+	}
+	return 0;
+}
+
+FUNC_DECL_PREFIX long so_ftell(SO_FILE *stream)
+{
+	return  stream->size;
+}
+
+FUNC_DECL_PREFIX SO_FILE *so_popen(const char *command, const char *type)
+{
+	return 0;
+}
+
+FUNC_DECL_PREFIX int so_pclose(SO_FILE *stream)
+{
+	return 0;
+}
